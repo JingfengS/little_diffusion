@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "little_diffusion"
+version = "0.1.0"
+description = "A minimal diffusion model for learning"
+requires-python = ">=3.8"
+dependencies = [
+    # 这里留空，因为你用 Conda 管理依赖
+    # 如果你想明确写出来也可以，比如 "torch", "numpy"
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
