@@ -408,7 +408,7 @@ class Trainer(ABC):
                     x = x.to(device)
 
                     opt.zero_grad()
-                    loss = self.get_train_loss(x=x, **kwargs)
+                    loss = self.get_train_loss(target=x, **kwargs)
                     loss.backward()
                     opt.step()
 
