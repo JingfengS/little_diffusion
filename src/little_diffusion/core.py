@@ -174,7 +174,7 @@ class Simulator(ABC):
         Returns:
             - x_final: final state at time ts[-1], shape (batch_size, dim)
         """
-        for t_idx in range(len(ts) - 1):
+        for t_idx in range(ts.shape[1] - 1):
             t = ts[:, t_idx]
             h = ts[:, t_idx + 1] - ts[:, t_idx]
             x = self.step(x, t, h)
