@@ -4,13 +4,12 @@ import torch
 import logging
 import numpy as np
 from pathlib import Path
-from typing import List, Optional, Union, Dict
+from typing import List, Optional, Union
 from PIL import Image
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from diffusers import AutoencoderKL
-from torchvision.transforms import functional as TF
 
 logger = logging.getLogger(__name__)
 
@@ -144,7 +143,7 @@ class VAEProcessor:
         all_latents = []
         all_labels = []
         
-        logger.info(f"📸 Starting VAE Encoding...")
+        logger.info("📸 Starting VAE Encoding...")
         
         for batch_imgs, batch_labels in tqdm(dataloader, desc="Encoding"):
             # 1. 搬运图片到 GPU
