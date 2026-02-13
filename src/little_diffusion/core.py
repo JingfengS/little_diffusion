@@ -167,17 +167,20 @@ class Simulator(ABC):
     @torch.no_grad()
     def simulate(self, x: torch.Tensor, ts: torch.Tensor):
         """
-        Simulates using the discretization gives by ts
-        Args:
-            - x_init: initial state at time ts[0], shape (batch_size, dim)
-            - ts: timesteps, shape (bs, num_timesteps,1)
-        Returns:
-            - x_final: final state at time ts[-1], shape (batch_size, dim)
+        极速版 Simulate (内存友好)
         """
-        for t_idx in range(ts.shape[1] - 1):
+        # 防呆检查：确保传进来的 ts 至少有两个点，并且形状是 (B, L, 1)
+        assert ts.dim() == 3 and ts.shape[2] == 1, f"ts 形状必须是 (B, Steps, 1), 但拿到了 {ts.shape}"
+        assert ts.shape[1] > 1, "ts 必须包含至少两个时间点！"
+
+        from tqdm import tqdm
+        
+        # 直接就地更新 x，不需要保存中间状态
+        for t_idx in tqdm(range(ts.shape[1] - 1), desc="Flow Matching 采样"):
             t = ts[:, t_idx]
             h = ts[:, t_idx + 1] - ts[:, t_idx]
             x = self.step(x, t, h)
+            
         return x
 
     @torch.no_grad()

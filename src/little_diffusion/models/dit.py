@@ -3,7 +3,7 @@ import torch.nn as nn
 
 # 导入新的 Config 和 组件
 from .config import DiTConfig
-from .embeddings import TimestepEmbedder, LabelEmbedder, precompute_freqs_cis
+from .embeddings import TimestepEmbedder, LabelEmbedder, precompute_freqs_cis_2d
 from .blocks import DiTBlock
 
 class FinalLayer(nn.Module):
@@ -59,11 +59,13 @@ class DiT(nn.Module):
         
         # 5. Initialize Weights
         self.initialize_weights()
+
+        grid_h = self.input_size // self.patch_size
+        grid_w = self.input_size // self.patch_size
         
         # 6. Precompute RoPE
-        num_patches = (self.input_size // self.patch_size) ** 2
         head_dim = self.hidden_size // self.num_heads
-        self.register_buffer("freqs_cis", precompute_freqs_cis(head_dim, num_patches), persistent=False)
+        self.register_buffer("freqs_cis", precompute_freqs_cis_2d(head_dim, grid_h, grid_w), persistent=False)
 
     def initialize_weights(self):
         def _basic_init(module):

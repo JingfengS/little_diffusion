@@ -24,23 +24,30 @@ class FlowMatchingTrainer(Trainer):
         super().__init__(model)
         self.path = path
 
-    def get_train_loss(self, target: torch.Tensor, **kwargs):
+    def get_train_loss(self, target: torch.Tensor, labels: torch.Tensor = None, **kwargs):
         # target: (batch, 3, H, W)
         bs = target.shape[0]
         device = target.device
 
-        t = torch.rand(bs, 1, device=device)
+        # 1. 采样时间 t (0.0 ~ 1.0)
+        t = torch.rand(bs, device=device)
         x0 = torch.randn_like(target)
 
+        # 2. 调用 Path 计算 xt 和目标速度 ut
         xt = self.path.sample_conditional_path(x0, target, t)
-
         ut = self.path.conditional_vector_field(x0, target)
-        ut_pred = self.model(xt, t)
+
+        # 3. 适配 DiT：将 float 的 t 映射为 0~1000 的整数
+        t_model = (t * 1000).long()
+
+        # 4. 前向传播 (支持 CFG Labels)
+        if labels is not None:
+            ut_pred = self.model(xt, t_model, labels)
+        else:
+            ut_pred = self.model(xt, t_model)
 
         loss = torch.nn.functional.mse_loss(ut_pred, ut)
         return loss
-        
-
 
 
     

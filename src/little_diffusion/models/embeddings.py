@@ -92,14 +92,34 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     x_out = torch.stack([x_out.real, x_out.imag], dim=-1).flatten(3)
     return x_out.type_as(x)
 
-def precompute_freqs_cis(dim, end, theta=10000.0):
+def precompute_freqs_cis_2d(dim: int, h: int, w: int, theta: float = 10000.0) -> torch.Tensor:
     """
-    预计算旋转角度 (cis = cos + i*sin)
+    专为图像生成的 2D RoPE (X 和 Y 轴各占一半维度)
+    dim: 注意力头的维度 (比如 Hidden=768, Heads=12, 那么 dim=64)
+    h: 序列在高度上的 Patch 数量
+    w: 序列在宽度上的 Patch 数量
     """
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device)  # type: ignore
-    freqs = torch.outer(t, freqs).float()  # (L, D/2)
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    half_dim = dim // 2  # 一半给 Y，一半给 X
+    
+    # 预计算 Y 轴和 X 轴的频率
+    freqs_y = 1.0 / (theta ** (torch.arange(0, half_dim, 2).float() / half_dim))
+    freqs_x = 1.0 / (theta ** (torch.arange(0, half_dim, 2).float() / half_dim))
+
+    t_y = torch.arange(h, device=freqs_y.device)
+    t_x = torch.arange(w, device=freqs_x.device)
+
+    # 计算外积 (H, dim/4) 和 (W, dim/4)
+    freqs_y = torch.outer(t_y, freqs_y).float()
+    freqs_x = torch.outer(t_x, freqs_x).float()
+
+    # 广播到完整的二维网格大小 (H, W, dim/4)
+    freqs_y = freqs_y.unsqueeze(1).expand(h, w, -1)
+    freqs_x = freqs_x.unsqueeze(0).expand(h, w, -1)
+
+    # 拼接起来，得到 (H, W, dim/2)，然后展平为 (L, dim/2)
+    freqs = torch.cat((freqs_y, freqs_x), dim=-1).reshape(h * w, -1)
+    
+    # 转为复数张量
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs) 
     return freqs_cis
-        
         
