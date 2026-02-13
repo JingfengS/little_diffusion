@@ -1,5 +1,5 @@
 import torch
-from little_diffusion.core import ConditionalProbabilityPath, Trainer, Sampleable
+from little_diffusion.core import ConditionalProbabilityPath, Trainer
 
 class LinearProbabilityPath(ConditionalProbabilityPath):
     def __init__(self):

@@ -1,9 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.distributions as D
-import numpy as np
 from abc import ABC, abstractmethod
-from typing import Optional, Tuple
 from tqdm import tqdm
 from torch.func import jacrev, vmap
 

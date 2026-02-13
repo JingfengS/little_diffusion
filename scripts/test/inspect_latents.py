@@ -4,7 +4,6 @@ import logging
 import sys
 import random
 from pathlib import Path
-from PIL import Image
 
 # 确保能导入 src
 sys.path.append(str(Path(__file__).parent.parent / "src"))
