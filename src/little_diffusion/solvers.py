@@ -24,7 +24,7 @@ class FlowMatchingTrainer(Trainer):
         super().__init__(model)
         self.path = path
 
-    def get_train_loss(self, target: torch.Tensor, labels: torch.Tensor = None, **kwargs):
+    def get_train_loss(self, target: torch.Tensor, labels: torch.Tensor = None, mask: torch.Tensor = None, **kwargs):
         # target: (batch, 3, H, W)
         bs = target.shape[0]
         device = target.device
@@ -42,12 +42,18 @@ class FlowMatchingTrainer(Trainer):
 
         # 4. 前向传播 (支持 CFG Labels)
         if labels is not None:
-            ut_pred = self.model(xt, t_model, labels)
+            ut_pred = self.model(xt, t_model, labels, mask=mask)
         else:
-            ut_pred = self.model(xt, t_model)
+            ut_pred = self.model(xt, t_model, mask=mask)
+        if mask is not None:
+            # ut_pred: (BS, 4, H, W)
+            # mask: (BS, 1, H, W) -> (BS, 4, H, W)
+            diff = ut_pred - ut
+            loss = (diff ** 2) * mask
+            return loss.mean()
+        else:
+            return torch.nn.functional.mse_loss(ut_pred, ut)
 
-        loss = torch.nn.functional.mse_loss(ut_pred, ut)
-        return loss
 
 
     

@@ -1,204 +1,291 @@
-import argparse
 import torch
-import os
-import time
-import logging
-import signal
-import sys
-from pathlib import Path
+import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
-from little_diffusion.models import BabyUNet
+from tqdm import tqdm
+import logging
+import argparse
+import sys
+import time
+import signal
+from pathlib import Path
+
+# 引入我们的工业级模块
+from little_diffusion.models.config import DiTConfig
+from little_diffusion.models.dit import DiT
 from little_diffusion.solvers import LinearProbabilityPath, FlowMatchingTrainer
 
 # ================= 🚀 5070 Ti 极速模式设置 =================
-# 开启 TensorFloat-32 (TF32)，在 Ampere/Hopper 架构上获得 FP32 的精度 + 接近 FP16 的速度
-torch.set_float32_matmul_precision('high')
-# 屏蔽一些编译时的烦人警告
+# 开启 TF32 (Ampere/Hopper/Blackwell 专属)
+torch.set_float32_matmul_precision("high")
+# 抑制编译噪音
 torch._dynamo.config.suppress_errors = True
 
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s | %(levelname)s | %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
 
 # ================= 🛠️ 参数解析 =================
 def get_args():
-    parser = argparse.ArgumentParser(description="🚀 Industrial Flow Matching Trainer (Latent)")
-    
+    parser = argparse.ArgumentParser(
+        description="🚀 Robust DiT Trainer with Resume & Triton"
+    )
+
     # 基础配置
-    parser.add_argument("--name", type=str, default="run", help="Experiment name")
-    parser.add_argument("--data", type=str, required=True, help="Path to .pt latents file")
-    parser.add_argument("--save_dir", type=str, default="./checkpoints", help="Directory to save checkpoints")
-    
+    parser.add_argument(
+        "--name", type=str, default="dit_test_run", help="Experiment name"
+    )
+    parser.add_argument(
+        "--data", type=str, required=True, help="Path to arknights_latents_1024.pt"
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="checkpoints/",
+        help="Directory to save checkpoints",
+    )
+
     # 训练超参
-    parser.add_argument("--epochs", type=int, default=5000)
-    parser.add_argument("--batch_size", type=int, default=32, help="Try 64 or 128 for 5070 Ti")
-    parser.add_argument("--lr", type=float, default=5e-4)
-    parser.add_argument("--dim", type=int, default=128, help="Model width (hidden dimension)")
-    
-    # 进阶功能
-    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint (.pth) to resume from")
-    parser.add_argument("--no_compile", action="store_true", help="Disable torch.compile (use if errors occur)")
-    parser.add_argument("--save_every", type=int, default=500, help="Save checkpoint every X epochs")
-    
+    parser.add_argument("--epochs", type=int, default=1000)
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=32,
+        help="Adjust based on VRAM (16-32 for 5070Ti)",
+    )
+    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument(
+        "--save_every", type=int, default=50, help="Save checkpoint every X epochs"
+    )
+
+    # 续训控制
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default="latest",
+        help="Path to checkpoint or 'latest' to auto-resume",
+    )
+    parser.add_argument(
+        "--force_restart",
+        action="store_true",
+        help="Ignore existing checkpoints and start over",
+    )
+
+    # 调试选项
+    parser.add_argument(
+        "--debug", action="store_true", help="Run with small model for testing"
+    )
+
     return parser.parse_args()
 
-# ================= 🧠 核心训练逻辑 =================
+
+# ================= 💾 Checkpoint 管理器 =================
+class CheckpointManager:
+    def __init__(self, save_dir, experiment_name):
+        self.save_dir = Path(save_dir) / experiment_name
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        self.name = experiment_name
+        self.latest_path = self.save_dir / "arknights_latest_checkpoint.pth"
+
+    def save(self, model, optimizer, epoch, loss, config, is_best=False):
+        """保存完整状态"""
+        # 如果模型被 compile 过，它的 state_dict key 会带有 "_orig_mod." 前缀
+        # 我们需要去除它，以便未来加载时不受 compile 状态影响
+        raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+
+        state = {
+            "epoch": epoch,
+            "model_state_dict": raw_model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "loss": loss,
+            "config": config.model_dump(),  # 保存 Pydantic Config
+            "rng_state": torch.get_rng_state(),
+            "cuda_rng_state": torch.cuda.get_rng_state(),
+            "timestamp": time.time(),
+        }
+
+        # 1. 保存为 latest (覆盖)
+        torch.save(state, self.latest_path)
+
+        # 2. 保存为 epoch 历史 (归档)
+        epoch_path = self.save_dir / f"epoch_{epoch:04d}.pth"
+        torch.save(state, epoch_path)
+
+        logger.info(f"💾 Saved Checkpoint: Epoch {epoch} | Loss: {loss:.4f}")
+
+    def load(self, path, model, optimizer=None):
+        """加载完整状态"""
+        if path == "latest":
+            path = self.latest_path
+
+        path = Path(path)
+        if not path.exists():
+            logger.warning(f"⚠️ Checkpoint not found: {path}")
+            return 0  # Start from epoch 0
+
+        logger.info(f"♻️ Loading checkpoint from {path}...")
+        checkpoint = torch.load(path, map_location="cpu")  # 先加载到 CPU 省显存
+
+        # 加载模型权重
+        msg = model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+        logger.info(f"   -> Model Weights Loaded: {msg}")
+
+        # 加载优化器
+        if optimizer and "optimizer_state_dict" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            logger.info("   -> Optimizer State Restored")
+
+        # 恢复随机种子 (确保复现性)
+        if "rng_state" in checkpoint:
+            torch.set_rng_state(checkpoint["rng_state"])
+            if torch.cuda.is_available():
+                torch.cuda.set_rng_state(checkpoint["cuda_rng_state"])
+
+        start_epoch = checkpoint["epoch"] + 1
+        logger.info(f"✅ Successfully Resumed from Epoch {start_epoch}")
+        return start_epoch
+
+
+# ================= 🧠 主程序 =================
 def main():
     args = get_args()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    logger.info(f"🔧 Device: {device} | Experiment: {args.name}")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # 1. 动态加载 Latent 数据
-    if not os.path.exists(args.data):
-        logger.error(f"❌ Data file not found: {args.data}")
-        return
+    # 1. 准备数据
+    logger.info(f"📦 Loading dataset from {args.data}...")
+    data_payload = torch.load(args.data, map_location="cpu")
 
-    logger.info("📦 Loading latents into VRAM...")
-    # map_location=device 直接加载进显存，因为 Latent 数据通常很小 (<2GB)
-    # 如果数据特别大，请改用 map_location='cpu'
-    latents = torch.load(args.data, map_location=device)
-    
-    # 自动识别尺寸 (N, 4, H, W)
-    N, C, H, W = latents.shape
-    logger.info(f"📊 Dataset Shape: {latents.shape}")
-    logger.info(f"   - Images: {N}")
-    logger.info(f"   - Latent Size: {H}x{W} (Equivalent to Pixel {H*8}x{W*8})")
+    if isinstance(data_payload, dict):
+        all_latents = data_payload["latents"]  # (N, 4, 128, 128)
+        all_labels = data_payload["labels"]  # (N,)
 
-    # 构造 Dataset
-    # 如果只有少量图片，repeat 一下让每个 Epoch 多跑几步，避免 tqdm 刷屏太快
-    if N < 1000:
-        repeat_factor = 1000 // N
-        logger.info(f"🔄 Small dataset detected. Repeating {repeat_factor} times per epoch.")
-        dataset = TensorDataset(latents.repeat(repeat_factor, 1, 1, 1))
+        all_masks = data_payload.get('masks', None)
+        if all_masks is None:
+            logger.warning("⚠️ No masks found in .pt file! Fallback to standard Loss.")
+            # 创建全 1 mask 以防万一，或者在 Dataset 里处理
+            all_masks = torch.ones(all_latents.shape[0], 1, all_latents.shape[2], all_latents.shape[3])
+        # 自动获取类别数
+        num_classes = int(torch.max(all_labels).item()) + 1
     else:
-        dataset = TensorDataset(latents)
-        
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+        raise ValueError("Unsupported .pt format")
 
-    # 2. 初始化模型
-    # 注意：in/out channels 自动设为 C (通常是 4)
-    model = BabyUNet(in_channels=C, out_channels=C, dim=args.dim).to(device)
-    
-    # 🚀 5070 Ti 加速神器: torch.compile
-    # 第一次运行会花 1-2 分钟编译，之后速度提升 30%-50%
-    if not args.no_compile:
-        logger.info("⚡️ Compiling model with torch.compile (Mode: max-autotune)...")
-        try:
-            model = torch.compile(model, mode="max-autotune")
-        except Exception as e:
-            logger.warning(f"⚠️ Compile failed: {e}. Fallback to standard mode.")
+    logger.info(f"📊 Dataset: {len(all_latents)} images, {num_classes} classes")
 
-    # 3. 优化器 & 混合精度 Scaler
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    scaler = torch.amp.GradScaler('cuda') # 混合精度的大脑
+    dataset = TensorDataset(all_latents, all_masks, all_labels)
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,
+    )
 
+    # 2. 初始化模型 Config
+    if args.debug:
+        logger.warning("🐛 DEBUG MODE: Using Tiny DiT")
+        config = DiTConfig(
+            input_size=128,
+            patch_size=2,
+            hidden_size=64,
+            depth=2,
+            num_heads=4,
+            num_classes=num_classes + 1,
+        )
+    else:
+        # 标准 Small 配置
+        config = DiTConfig(
+            input_size=128,
+            patch_size=4,
+            hidden_size=768,
+            depth=12,
+            num_heads=12,
+            num_classes=num_classes + 1,
+        )
+
+    model = DiT(config).to(device)
+
+    # 统计参数
+    params = sum(p.numel() for p in model.parameters()) / 1e6
+    logger.info(f"🧠 Model Initialized ({params:.2f}M params)")
+
+    # 3. 优化器 (启用 Fused)
+    optimizer = optim.AdamW(
+        model.parameters(), lr=args.lr, weight_decay=0.0, fused=True
+    )
+
+    # 4. Checkpoint 管理
+    ckpt_manager = CheckpointManager(args.output_dir, args.name)
     start_epoch = 0
 
-    # 4. 断点续训逻辑 (Robustness)
-    if args.resume:
-        if os.path.isfile(args.resume):
-            logger.info(f"♻️ Resuming from checkpoint: {args.resume}")
-            checkpoint = torch.load(args.resume, map_location=device)
-            
-            # 处理 compile 带来的前缀问题
-            state_dict = checkpoint['model_state_dict']
-            new_state_dict = {}
-            for k, v in state_dict.items():
-                if k.startswith("_orig_mod."):
-                    new_state_dict[k[10:]] = v
-                else:
-                    new_state_dict[k] = v
-            
-            # 加载权重
-            model.load_state_dict(new_state_dict, strict=False) # strict=False 允许一定的灵活性
-            
-            # 恢复优化器状态 (重要！否则 LR 会重置)
-            if 'optimizer_state_dict' in checkpoint:
-                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            
-            # 恢复 Epoch
-            start_epoch = checkpoint.get('epoch', 0) + 1
-            logger.info(f"   -> Resuming at Epoch {start_epoch}")
-        else:
-            logger.warning(f"⚠️ Checkpoint not found: {args.resume}. Starting from scratch.")
+    # 尝试恢复训练
+    if not args.force_restart:
+        start_epoch = ckpt_manager.load(args.resume, model, optimizer)
+        # 将优化器状态移动到 GPU (因为 load 是在 cpu 做的)
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(device)
 
-    # 5. 准备训练组件
+    # 5. 编译模型 (Resume 之后再编译)
+    logger.info("🔥 Compiling model with Triton (mode='max-autotune')...")
+    # max-autotune 可能会慢，如果你觉得卡住太久，可以改成 'default'
+    model = torch.compile(model, mode="max-autotune")
     path = LinearProbabilityPath()
     trainer = FlowMatchingTrainer(model, path)
-    
-    save_dir = Path(args.save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
-    
-    # 优雅退出处理 (Ctrl+C)
+
+    # 6. 信号捕获 (Ctrl+C)
     def signal_handler(sig, frame):
         logger.info("\n🛑 Interrupt received! Saving emergency checkpoint...")
-        save_checkpoint(model, optimizer, start_epoch, save_dir / f"{args.name}_interrupted.pth")
+        try:
+            ckpt_manager.save(model, optimizer, epoch, avg_loss, config)
+        except Exception: 
+            pass
         sys.exit(0)
+
     signal.signal(signal.SIGINT, signal_handler)
 
-    # ================= 🔄 训练循环 =================
-    logger.info("🔥 Starting Training...")
+    # 7. 训练循环
+    logger.info(f"🎬 Training Start: Epoch {start_epoch} -> {args.epochs}")
     model.train()
-    
-    t0 = time.time()
-    
+
     for epoch in range(start_epoch, args.epochs):
-        epoch_loss = 0
+        epoch_loss = 0.0
         steps = 0
-        
-        for batch in dataloader:
-            x1 = batch[0].to(device) # Target Latents
-            
-            optimizer.zero_grad()
-            
-            # ⚡️ 混合精度上下文 (Auto Mixed Precision)
-            # 这里的计算会自动转为 FP16，显存减半，速度翻倍
-            with torch.amp.autocast('cuda'):
-                loss = trainer.get_train_loss(target=x1)
-            
-            # ⚡️ Scaler 反向传播
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            
+        progress_bar = tqdm(loader, desc=f"Epoch {epoch + 1}/{args.epochs}", leave=True)
+
+        for latents, masks, labels in progress_bar:
+            latents = latents.to(device, non_blocking=True).to(torch.bfloat16)  # BF16
+            masks = masks.to(device, non_blocking=True).to(torch.bfloat16)
+            labels = labels.to(device, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
+
+            # --- Mixed Precision Training (BF16) ---
+            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                loss = trainer.get_train_loss(target=latents, labels=labels, mask=masks)
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+
             epoch_loss += loss.item()
             steps += 1
-            
+            progress_bar.set_postfix({"loss": f"{epoch_loss / steps:.4f}"})
+
         avg_loss = epoch_loss / steps
-        
-        # 打印日志 (每 100 轮)
-        if (epoch + 1) % 100 == 0:
-            elapsed = time.time() - t0
-            speed = (epoch + 1 - start_epoch) / elapsed
-            logger.info(f"Epoch {epoch+1:04d} | Loss: {avg_loss:.6f} | Speed: {speed:.1f} epoch/s")
 
-        # 定期保存 (Robust Checkpointing)
+        # --- 定期保存 ---
         if (epoch + 1) % args.save_every == 0:
-            save_path = save_dir / f"{args.name}_ep{epoch+1}.pth"
-            save_checkpoint(model, optimizer, epoch, save_path)
-            
-            # 同时也更新一个 latest.pth 方便随时 resume
-            save_checkpoint(model, optimizer, epoch, save_dir / f"{args.name}_latest.pth")
+            ckpt_manager.save(model, optimizer, epoch, avg_loss, config)
 
-    logger.info("✅ Training Finished!")
-    save_checkpoint(model, optimizer, args.epochs-1, save_dir / f"{args.name}_final.pth")
+    # 训练结束保存
+    ckpt_manager.save(model, optimizer, args.epochs - 1, avg_loss, config)
+    logger.info("🏁 Training Finished Successfully!")
 
-def save_checkpoint(model, optimizer, epoch, path):
-    """保存完整的训练状态，不仅仅是权重"""
-    torch.save({
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'config': { # 保存一些元数据，防止以后忘了这个模型是啥参数
-             'timestamp': time.time(),
-        }
-    }, path)
-    logger.info(f"💾 Saved checkpoint to {path}")
 
 if __name__ == "__main__":
     main()
