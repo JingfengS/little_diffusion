@@ -28,6 +28,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
 # ================= 🛠️ 参数解析 =================
 def get_args():
     parser = argparse.ArgumentParser(
@@ -162,11 +163,13 @@ def main():
         all_latents = data_payload["latents"]  # (N, 4, 128, 128)
         all_labels = data_payload["labels"]  # (N,)
 
-        all_masks = data_payload.get('masks', None)
+        all_masks = data_payload.get("masks", None)
         if all_masks is None:
             logger.warning("⚠️ No masks found in .pt file! Fallback to standard Loss.")
             # 创建全 1 mask 以防万一，或者在 Dataset 里处理
-            all_masks = torch.ones(all_latents.shape[0], 1, all_latents.shape[2], all_latents.shape[3])
+            all_masks = torch.ones(
+                all_latents.shape[0], 1, all_latents.shape[2], all_latents.shape[3]
+            )
         # 自动获取类别数
         num_classes = int(torch.max(all_labels).item()) + 1
     else:
@@ -217,6 +220,7 @@ def main():
         model.parameters(), lr=args.lr, weight_decay=0.0, fused=True
     )
 
+
     # 4. Checkpoint 管理
     ckpt_manager = CheckpointManager(args.output_dir, args.name)
     start_epoch = 0
@@ -230,6 +234,10 @@ def main():
                 if isinstance(v, torch.Tensor):
                     state[k] = v.to(device)
 
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs * len(loader), eta_min=1e-6
+    )
+
     # 5. 编译模型 (Resume 之后再编译)
     logger.info("🔥 Compiling model with Triton (mode='max-autotune')...")
     # max-autotune 可能会慢，如果你觉得卡住太久，可以改成 'default'
@@ -242,7 +250,7 @@ def main():
         logger.info("\n🛑 Interrupt received! Saving emergency checkpoint...")
         try:
             ckpt_manager.save(model, optimizer, epoch, avg_loss, config)
-        except Exception: 
+        except Exception:
             pass
         sys.exit(0)
 
@@ -263,6 +271,7 @@ def main():
             labels = labels.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
+            scheduler.step()
 
             # --- Mixed Precision Training (BF16) ---
             with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):

@@ -11,6 +11,7 @@ images/
 data/
 checkpoints/
 notebooks/
+.aim/
 
 # Distribution / packaging
 .Python

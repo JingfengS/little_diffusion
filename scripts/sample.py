@@ -8,7 +8,7 @@ import sys
 sys.path.append(str(Path(__file__).parent.parent / "src"))
 from little_diffusion.models.config import DiTConfig
 from little_diffusion.models.dit import DiT
-from little_diffusion.processor import VAEProcessor
+from little_diffusion.preprocessing.processor import VAEProcessor
 
 # 引入你的 Core 框架！
 from little_diffusion.core import ODE, EulerSimulator
