@@ -22,6 +22,38 @@ class FinalLayer(nn.Module):
         x = self.linear(x)
         return x
 
+class ConvPatchEmbedder(nn.Module):
+    """
+    使用小型的 CNN 替代线性的 Patch Embedding。
+    作用：为 DiT 注入“归纳偏置”，让它在训练初期就能看懂边缘和纹理，
+    从而在小样本 (3000张) 上也能快速收敛，避免画出混乱色块。
+    """
+    def __init__(self, in_channels, hidden_size, patch_size=2):
+        super().__init__()
+        # 这是一个 2 层的 ResNet-like 结构
+        # 假设 patch_size=2，我们需要把分辨率降低 2 倍
+        
+        mid_channels = max(hidden_size // 4, 32)
+        
+        self.net = nn.Sequential(
+            # 第一层：3x3 卷积，提取局部特征 (纹理/边缘)，不改变尺寸
+            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, stride=1),
+            nn.GroupNorm(4, mid_channels), # GN 比 BN 在小 Batch 下更稳
+            nn.SiLU(), # SiLU (Swish) 是 DiT 的标配激活函数
+            
+            # 第二层：3x3 卷积，负责下采样 (Patchify)
+            # stride=patch_size 完成了降维，同时保留了空间相关性
+            nn.Conv2d(mid_channels, hidden_size, kernel_size=3, padding=1, stride=patch_size),
+            nn.GroupNorm(32, hidden_size),
+            nn.SiLU(),
+            
+            # 第三层：1x1 卷积，特征对齐
+            nn.Conv2d(hidden_size, hidden_size, kernel_size=1)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
 class DiT(nn.Module):
     """
     Diffusion Transformer (Config-Driven)
@@ -39,9 +71,10 @@ class DiT(nn.Module):
         self.num_heads = config.num_heads
         
         # 1. Patch Embedding
-        self.x_embedder = nn.Conv2d(
-            config.in_channels, config.hidden_size, 
-            kernel_size=config.patch_size, stride=config.patch_size
+        self.x_embedder = ConvPatchEmbedder(
+            in_channels=config.in_channels,
+            hidden_size=config.hidden_size,
+            patch_size=config.patch_size
         )
         
         # 2. Condition Embedding
@@ -75,8 +108,11 @@ class DiT(nn.Module):
                     nn.init.constant_(module.bias, 0)
         self.apply(_basic_init)
 
-        w = self.x_embedder.weight.data
-        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+        for m in self.x_embedder.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
 
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)

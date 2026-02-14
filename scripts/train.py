@@ -54,7 +54,7 @@ def get_args():
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=32,
+        default=16,
         help="Adjust based on VRAM (16-32 for 5070Ti)",
     )
     parser.add_argument("--lr", type=float, default=5e-5)
@@ -193,19 +193,19 @@ def main():
         config = DiTConfig(
             input_size=128,
             patch_size=2,
-            hidden_size=64,
-            depth=2,
-            num_heads=4,
+            hidden_size=384,
+            depth=4,
+            num_heads=6,
             num_classes=num_classes + 1,
         )
     else:
         # 标准 Small 配置
         config = DiTConfig(
             input_size=128,
-            patch_size=4,
-            hidden_size=768,
-            depth=12,
-            num_heads=12,
+            patch_size=2,
+            hidden_size=384,
+            depth=10,
+            num_heads=6,
             num_classes=num_classes + 1,
         )
 
@@ -271,7 +271,6 @@ def main():
             labels = labels.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            scheduler.step()
 
             # --- Mixed Precision Training (BF16) ---
             with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -280,6 +279,7 @@ def main():
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+            scheduler.step()
 
             epoch_loss += loss.item()
             steps += 1

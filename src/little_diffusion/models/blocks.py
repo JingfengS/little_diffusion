@@ -60,6 +60,47 @@ class Mlp(nn.Module):
         x = self.fc2(x)
         return x
 
+class ConvMlp(nn.Module):
+    """
+    🔥 混合架构核心：带卷积的 MLP
+    替代纯 Linear, 引入 'Inductive Bias' (归纳偏置), 让模型天生懂得 '邻域' 概念。
+    """
+    def __init__(self, in_features, hidden_features, out_features, act_layer=nn.GELU, drop=0.):
+        super().__init__()
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        
+        # 🔥 Depthwise Convolution (3x3)
+        # 这就是 UNet 的灵魂！它强制模型在处理特征时，必须看一眼周围 3x3 的像素。
+        self.dwconv = nn.Conv2d(
+            hidden_features, hidden_features, 
+            kernel_size=3, padding=1, groups=hidden_features
+        )
+        
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x, H, W):
+        # x: (B, L, C)
+        B, L, C = x.shape
+        
+        # 1. Linear Projection
+        x = self.fc1(x) # (B, L, Hidden)
+        
+        # 2. Reshape & Conv (提取局部特征)
+        # 变换为图像格式 (B, Hidden, H, W) 以进行卷积
+        x_img = x.transpose(1, 2).view(B, -1, H, W)
+        x_img = self.dwconv(x_img)
+        # 变回序列格式
+        x = x_img.flatten(2).transpose(1, 2) # (B, L, Hidden)
+        
+        # 3. Activation & Output
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
@@ -75,7 +116,11 @@ class DiTBlock(nn.Module):
         
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, out_features=hidden_size, act_layer=nn.GELU)
+        self.mlp = ConvMlp(
+            in_features=hidden_size,
+            hidden_features=mlp_hidden_dim,
+            out_features=hidden_size,
+        )
         
         # AdaLN 调制参数预测层
         # 输入是 time_emb + label_emb，输出 6 个参数:
@@ -92,12 +137,15 @@ class DiTBlock(nn.Module):
         freqs_cis: RoPE position info
         """
         # 预测调制参数
+        B, L, D = x.shape
+        H = W = int(L ** 0.5)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
         
         # Attention Block with Modulation
         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), freqs_cis)
         
         # MLP Block with Modulation
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        mlp_input = modulate(self.norm2(x), shift_mlp, scale_mlp)
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(mlp_input, H, W)
         
         return x
